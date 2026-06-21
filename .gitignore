@@ -1,0 +1,63 @@
+# Develop tools
+/.idea/
+/.trunk
+
+# VS Code workspace files (keep settings for consistency)
+/.vscode/*
+!/.vscode/settings.json
+
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Folders
+_obj
+_test
+_build
+
+# Architecture specific extensions/prefixes
+*.[568vq]
+[568vq].out
+
+*.cgo1.go
+*.cgo2.c
+_cgo_defun.c
+_cgo_gotypes.go
+_cgo_export.*
+
+# Test binary, build with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+coverage.html
+
+# vim temp files
+*~
+*.swp
+*.swo
+
+# go work files
+go.work
+go.work.sum
+
+# Build artifacts
+dist/
+bin/
+
+# Example binaries (go build in examples/)
+examples/**/server/server
+examples/**/client/client
+examples/mcp/documented/documented
+examples/mcp/hello/hello
+
+# IDE-specific files
+.DS_Store
+/micro
+
+# Built example/harness binaries (go build ./path/... drops these at repo root)
+/plan-delegate
+/agent-plan-delegate
