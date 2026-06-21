@@ -158,3 +158,10 @@ func NetListener(customListener net.Listener) ListenOption {
 		o.Context = context.WithValue(o.Context, netListener{}, customListener)
 	}
 }
+
+// WithContext sets the context for dial options.
+func WithContext(ctx context.Context) DialOption {
+	return func(o *DialOptions) {
+		o.Context = ctx
+	}
+}

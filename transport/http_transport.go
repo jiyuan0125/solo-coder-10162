@@ -2,6 +2,7 @@ package transport
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
@@ -46,33 +47,60 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 		opt(&dopts)
 	}
 
+	ctx := dopts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	var (
 		conn net.Conn
 		err  error
 	)
 
-	if h.opts.Secure || h.opts.TLSConfig != nil {
-		config := h.opts.TLSConfig
-		if config == nil {
-			config = &tls.Config{
-				InsecureSkipVerify: dopts.InsecureSkipVerify,
+	dialer := &net.Dialer{Timeout: dopts.Timeout}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if h.opts.Secure || h.opts.TLSConfig != nil {
+			config := h.opts.TLSConfig
+			if config == nil {
+				config = &tls.Config{
+					InsecureSkipVerify: dopts.InsecureSkipVerify,
+				}
 			}
+
+			config.NextProtos = []string{"http/1.1"}
+
+			conn, err = newConn(func(addr string) (net.Conn, error) {
+				return tls.DialWithDialer(dialer, "tcp", addr, config)
+			})(addr)
+		} else {
+			conn, err = newConn(func(addr string) (net.Conn, error) {
+				return dialer.DialContext(ctx, "tcp", addr)
+			})(addr)
 		}
+	}()
 
-		config.NextProtos = []string{"http/1.1"}
-
-		conn, err = newConn(func(addr string) (net.Conn, error) {
-			return tls.DialWithDialer(&net.Dialer{Timeout: dopts.Timeout}, "tcp", addr, config)
-		})(addr)
-	} else {
-		conn, err = newConn(func(addr string) (net.Conn, error) {
-			return net.DialTimeout("tcp", addr, dopts.Timeout)
-		})(addr)
+	select {
+	case <-ctx.Done():
+		if conn != nil {
+			conn.Close()
+		}
+		return nil, ctx.Err()
+	case <-done:
 	}
 
 	if err != nil {
 		return nil, err
 	}
+
+	go func() {
+		<-ctx.Done()
+		if conn != nil {
+			conn.Close()
+		}
+	}()
 
 	return &httpTransportClient{
 		ht:       h,

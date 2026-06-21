@@ -106,9 +106,7 @@ func (r *rpcClient) call(
 
 	cTimeout := opts.ConnectionTimeout
 
-	if cTimeout > 0 {
-		msg.Header["Timeout"] = fmt.Sprintf("%d", cTimeout)
-	}
+	msg.Header["Timeout"] = fmt.Sprintf("%d", cTimeout)
 	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
 	// set the accept header
@@ -135,6 +133,7 @@ func (r *rpcClient) call(
 
 	dOpts := []transport.DialOption{
 		transport.WithStream(),
+		transport.WithContext(ctx),
 	}
 
 	if opts.DialTimeout >= 0 {
@@ -191,6 +190,17 @@ func (r *rpcClient) call(
 		defer func() {
 			if r := recover(); r != nil {
 				ch <- merrors.InternalServerError("go.micro.client", "panic recovered: %v", r)
+			}
+		}()
+
+		cancelCh := make(chan struct{})
+		defer close(cancelCh)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				stream.Close()
+			case <-cancelCh:
 			}
 		}()
 
@@ -273,9 +283,7 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		}
 	}
 
-	if opts.StreamTimeout > time.Duration(0) {
-		msg.Header["Timeout"] = fmt.Sprintf("%d", opts.StreamTimeout)
-	}
+	msg.Header["Timeout"] = fmt.Sprintf("%d", opts.StreamTimeout)
 	msg.Header["Content-Type"] = req.ContentType()
 	msg.Header["Accept"] = req.ContentType()
 
@@ -292,6 +300,7 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 
 	dOpts := []transport.DialOption{
 		transport.WithStream(),
+		transport.WithContext(ctx),
 	}
 
 	if opts.DialTimeout >= 0 {
@@ -340,6 +349,17 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		defer func() {
 			if r := recover(); r != nil {
 				ch <- merrors.InternalServerError("go.micro.client", "panic recovered: %v", r)
+			}
+		}()
+
+		cancelCh := make(chan struct{})
+		defer close(cancelCh)
+
+		go func() {
+			select {
+			case <-ctx.Done():
+				stream.Close()
+			case <-cancelCh:
 			}
 		}()
 
