@@ -2,6 +2,7 @@ package registry
 
 import (
 	"errors"
+	"sync"
 )
 
 type memWatcher struct {
@@ -9,6 +10,8 @@ type memWatcher struct {
 	res  chan *Result
 	exit chan bool
 	id   string
+	reg  *memRegistry
+	once sync.Once
 }
 
 func (m *memWatcher) Next() (*Result, error) {
@@ -26,10 +29,10 @@ func (m *memWatcher) Next() (*Result, error) {
 }
 
 func (m *memWatcher) Stop() {
-	select {
-	case <-m.exit:
-		return
-	default:
+	m.once.Do(func() {
 		close(m.exit)
-	}
+		if m.reg != nil {
+			m.reg.removeWatcher(m.id)
+		}
+	})
 }

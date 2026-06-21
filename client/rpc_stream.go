@@ -55,6 +55,13 @@ func (r *rpcStream) Send(msg interface{}) error {
 	r.Lock()
 	defer r.Unlock()
 
+	select {
+	case <-r.context.Done():
+		r.err = r.context.Err()
+		return r.err
+	default:
+	}
+
 	if r.isClosed() {
 		r.err = errShutdown
 		return errShutdown
@@ -78,6 +85,14 @@ func (r *rpcStream) Send(msg interface{}) error {
 
 func (r *rpcStream) Recv(msg interface{}) error {
 	r.Lock()
+
+	select {
+	case <-r.context.Done():
+		r.err = r.context.Err()
+		r.Unlock()
+		return r.err
+	default:
+	}
 
 	if r.isClosed() {
 		r.err = errShutdown
@@ -109,9 +124,6 @@ func (r *rpcStream) Recv(msg interface{}) error {
 
 	switch {
 	case len(resp.Error) > 0:
-		// We've got an error response. Give this to the request;
-		// any subsequent requests will get the ReadResponseBody
-		// error if there is one.
 		if resp.Error != lastStreamResponseError {
 			r.err = serverError(resp.Error)
 		} else {

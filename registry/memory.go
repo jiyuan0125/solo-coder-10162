@@ -90,16 +90,22 @@ func (m *memRegistry) sendEvent(r *Result) {
 	for _, w := range watchers {
 		select {
 		case <-w.exit:
-			m.Lock()
-			delete(m.watchers, w.id)
-			m.Unlock()
+			m.removeWatcher(w.id)
 		default:
 			select {
 			case w.res <- r:
+			case <-w.exit:
+				m.removeWatcher(w.id)
 			case <-time.After(sendEventTime):
 			}
 		}
 	}
+}
+
+func (m *memRegistry) removeWatcher(id string) {
+	m.Lock()
+	delete(m.watchers, id)
+	m.Unlock()
 }
 
 func (m *memRegistry) Init(opts ...Option) error {
@@ -263,6 +269,7 @@ func (m *memRegistry) Watch(opts ...WatchOption) (Watcher, error) {
 		res:  make(chan *Result),
 		id:   uuid.New().String(),
 		wo:   wo,
+		reg:  m,
 	}
 
 	m.Lock()

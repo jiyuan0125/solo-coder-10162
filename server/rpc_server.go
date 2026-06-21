@@ -535,40 +535,65 @@ func (s *rpcServer) Start() error {
 	config := s.Options()
 	logger := config.Logger
 
-	// start listening on the listener
-	listener, err := config.Transport.Listen(config.Address, config.ListenOptions...)
+	var listener transport.Listener
+	var registered bool
+	var brokerConnected bool
+
+	defer func() {
+		if err := recover(); err != nil {
+			logger.Logf(log.ErrorLevel, "panic recovered in Start: %v", err)
+			if registered {
+				if derr := s.Deregister(); derr != nil {
+					logger.Logf(log.ErrorLevel, "failed to deregister during panic recovery: %v", derr)
+				}
+			}
+			if brokerConnected {
+				if derr := config.Broker.Disconnect(); derr != nil {
+					logger.Logf(log.ErrorLevel, "failed to disconnect broker during panic recovery: %v", derr)
+				}
+			}
+			if listener != nil {
+				if derr := listener.Close(); derr != nil {
+					logger.Logf(log.ErrorLevel, "failed to close listener during panic recovery: %v", derr)
+				}
+			}
+		}
+	}()
+
+	var err error
+	listener, err = config.Transport.Listen(config.Address, config.ListenOptions...)
 	if err != nil {
 		return err
 	}
 
 	logger.Logf(log.InfoLevel, "Transport [%s] Listening on %s", config.Transport.String(), listener.Addr())
 
-	// swap address
 	addr := s.swapAddr(config, listener.Addr())
 
-	// connect to the broker
 	brokerName := config.Broker.String()
 	if err = config.Broker.Connect(); err != nil {
 		logger.Logf(log.ErrorLevel, "Broker [%s] connect error: %v", brokerName, err)
+		if cerr := listener.Close(); cerr != nil {
+			logger.Logf(log.ErrorLevel, "failed to close listener after broker connect error: %v", cerr)
+		}
 		return err
 	}
+	brokerConnected = true
 
 	logger.Logf(log.InfoLevel, "Broker [%s] Connected to %s", brokerName, config.Broker.Address())
 
-	// Use RegisterCheck func before register
 	if err = s.opts.RegisterCheck(s.opts.Context); err != nil {
 		logger.Logf(log.ErrorLevel, "Server %s-%s register check error: %s", config.Name, config.Id, err)
 	} else if err = s.Register(); err != nil {
-		// Perform initial registration
 		logger.Logf(log.ErrorLevel, "Server %s-%s register error: %s", config.Name, config.Id, err)
+	} else {
+		registered = true
 	}
 
 	exit := make(chan bool)
 
-	// Listen for connections
 	go s.listen(listener, exit)
 
-	// Keep the service registered to registry
 	go s.registrar(listener, addr, config, exit)
 
 	s.setStarted(true)
