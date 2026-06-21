@@ -3,7 +3,9 @@ package client
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"go-micro.dev/v5/errors"
 	"go-micro.dev/v5/registry"
@@ -173,5 +175,92 @@ func TestCallWrapper(t *testing.T) {
 
 	if !called {
 		t.Fatal("wrapper not called")
+	}
+}
+
+func TestCallZeroTimeout(t *testing.T) {
+	service := "test.service"
+	endpoint := "Test.Endpoint"
+	address := "10.1.10.1:8080"
+
+	var capturedTimeout string
+	wrap := func(cf CallFunc) CallFunc {
+		return func(_ context.Context, node *registry.Node, req Request, _ interface{}, opts CallOptions) error {
+			if node.Address != address {
+				return fmt.Errorf("expected address: %s got %s", address, node.Address)
+			}
+			capturedTimeout = opts.ConnectionTimeout.String()
+			return nil
+		}
+	}
+
+	r := newTestRegistry()
+	c := NewClient(
+		Registry(r),
+		WrapCall(wrap),
+		ConnectionTimeout(0),
+	)
+
+	if err := c.Options().Selector.Init(selector.Registry(r)); err != nil {
+		t.Fatal("failed to initialize selector", err)
+	}
+
+	req := c.NewRequest(service, endpoint, nil)
+
+	if err := c.Call(context.Background(), req, nil, WithAddress(address)); err != nil {
+		t.Fatal("call with address error", err)
+	}
+
+	if capturedTimeout != "0s" {
+		t.Fatalf("expected zero timeout, got %s", capturedTimeout)
+	}
+}
+
+func TestRetryCancel(t *testing.T) {
+	service := "test.service"
+	endpoint := "Test.Endpoint"
+	address := "10.1.10.1"
+
+	var called int32
+	wrap := func(cf CallFunc) CallFunc {
+		return func(ctx context.Context, _ *registry.Node, _ Request, _ interface{}, _ CallOptions) error {
+			atomic.AddInt32(&called, 1)
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+				return nil
+			}
+		}
+	}
+
+	r := newTestRegistry()
+	c := NewClient(
+		Registry(r),
+		WrapCall(wrap),
+		Retry(RetryAlways),
+		Retries(2),
+		RequestTimeout(100*time.Millisecond),
+	)
+
+	if err := c.Options().Selector.Init(selector.Registry(r)); err != nil {
+		t.Fatal("failed to initialize selector", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	req := c.NewRequest(service, endpoint, nil)
+
+	err := c.Call(ctx, req, nil, WithAddress(address))
+	if err == nil {
+		t.Fatal("expected error from cancelled context")
+	}
+
+	time.Sleep(100 * time.Millisecond)
+
+	finalCalled := atomic.LoadInt32(&called)
+	if finalCalled > 2 {
+		t.Fatalf("expected at most 2 calls after cancel, got %d", finalCalled)
 	}
 }

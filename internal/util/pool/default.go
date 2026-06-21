@@ -71,17 +71,27 @@ func (p *poolConn) Created() time.Time {
 }
 
 func (p *pool) Get(addr string, opts ...transport.DialOption) (Conn, error) {
+	var dopts transport.DialOptions
+	for _, o := range opts {
+		o(&dopts)
+	}
+
+	if dopts.Context != nil {
+		select {
+		case <-dopts.Context.Done():
+			return nil, dopts.Context.Err()
+		default:
+		}
+	}
+
 	p.mu.Lock()
 	conns := p.conns[addr]
 
-	// While we have conns check age and then return one
-	// otherwise we'll create a new conn
 	for len(conns) > 0 {
 		conn := conns[len(conns)-1]
 		conns = conns[:len(conns)-1]
 		p.conns[addr] = conns
 
-		// If conn is old kill it and move on
 		if d := time.Since(conn.Created()); d > p.ttl {
 			if err := conn.close(); err != nil {
 				p.mu.Unlock()
@@ -95,7 +105,6 @@ func (p *pool) Get(addr string, opts ...transport.DialOption) (Conn, error) {
 			continue
 		}
 
-		// We got a good conn, lets unlock and return it
 		p.mu.Unlock()
 
 		return conn, nil

@@ -89,9 +89,15 @@ func (h *httpTransportClient) Send(m *Message) error {
 		default:
 		}
 		h.Unlock()
+	} else {
+		h.RLock()
+		if h.closed {
+			h.RUnlock()
+			return io.EOF
+		}
+		h.RUnlock()
 	}
 
-	// set timeout if its greater than 0
 	if h.ht.opts.Timeout > time.Duration(0) {
 		if err := h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout)); err != nil {
 			return err
@@ -99,10 +105,8 @@ func (h *httpTransportClient) Send(m *Message) error {
 	}
 
 	return req.Write(h.conn)
-
 }
 
-// Recv receives a message.
 func (h *httpTransportClient) Recv(msg *Message) (err error) {
 	if msg == nil {
 		return errors.New("message passed in is nil")
@@ -135,7 +139,6 @@ func (h *httpTransportClient) Recv(msg *Message) (err error) {
 		req = rc
 	}
 
-	// set timeout if its greater than 0
 	if h.ht.opts.Timeout > time.Duration(0) {
 		if err = h.conn.SetDeadline(time.Now().Add(h.ht.opts.Timeout)); err != nil {
 			return err

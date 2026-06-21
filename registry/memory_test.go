@@ -242,3 +242,61 @@ func TestMemoryRegistryTTLConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestSlowWatcherNonBlocking(t *testing.T) {
+	m := NewMemoryRegistry()
+
+	svc := &Service{
+		Name:    "slowtest",
+		Version: "1.0.0",
+		Nodes: []*Node{
+			{Id: "slow-1", Address: "localhost:9999"},
+		},
+	}
+
+	if err := m.Register(svc); err != nil {
+		t.Fatal(err)
+	}
+
+	w, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w.Next()
+	}()
+
+	time.Sleep(50 * time.Millisecond)
+
+	for i := 0; i < 200; i++ {
+		if err := m.Register(&Service{
+			Name:    "slowtest",
+			Version: "1.0.0",
+			Nodes: []*Node{
+				{Id: fmt.Sprintf("node-%d", i), Address: fmt.Sprintf("localhost:%d", 10000+i)},
+			},
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	services, err := m.GetService("slowtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	totalNodes := 0
+	for _, s := range services {
+		totalNodes += len(s.Nodes)
+	}
+
+	if totalNodes < 10 {
+		t.Fatalf("expected at least 10 nodes, got %d", totalNodes)
+	}
+
+	w.Stop()
+	<-done
+}

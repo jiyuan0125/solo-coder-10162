@@ -52,55 +52,96 @@ func (h *httpTransport) Dial(addr string, opts ...DialOption) (Client, error) {
 		ctx = context.Background()
 	}
 
+	dialer := &net.Dialer{Timeout: dopts.Timeout}
+
+	if ctx.Done() != nil {
+		var (
+			conn net.Conn
+			err  error
+		)
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			if h.opts.Secure || h.opts.TLSConfig != nil {
+				config := h.opts.TLSConfig
+				if config == nil {
+					config = &tls.Config{
+						InsecureSkipVerify: dopts.InsecureSkipVerify,
+					}
+				}
+
+				config.NextProtos = []string{"http/1.1"}
+
+				conn, err = newConn(func(addr string) (net.Conn, error) {
+					return tls.DialWithDialer(dialer, "tcp", addr, config)
+				})(addr)
+			} else {
+				conn, err = newConn(func(addr string) (net.Conn, error) {
+					return dialer.DialContext(ctx, "tcp", addr)
+				})(addr)
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+			if conn != nil {
+				conn.Close()
+			}
+			return nil, ctx.Err()
+		case <-done:
+		}
+
+		if err != nil {
+			return nil, err
+		}
+
+		client := &httpTransportClient{
+			ht:       h,
+			addr:     addr,
+			conn:     conn,
+			buff:     bufio.NewReader(conn),
+			dialOpts: dopts,
+			req:      make(chan *http.Request, 100),
+			local:    conn.LocalAddr().String(),
+			remote:   conn.RemoteAddr().String(),
+		}
+
+		go func() {
+			<-ctx.Done()
+			client.Close()
+		}()
+
+		return client, nil
+	}
+
 	var (
 		conn net.Conn
 		err  error
 	)
 
-	dialer := &net.Dialer{Timeout: dopts.Timeout}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		if h.opts.Secure || h.opts.TLSConfig != nil {
-			config := h.opts.TLSConfig
-			if config == nil {
-				config = &tls.Config{
-					InsecureSkipVerify: dopts.InsecureSkipVerify,
-				}
+	if h.opts.Secure || h.opts.TLSConfig != nil {
+		config := h.opts.TLSConfig
+		if config == nil {
+			config = &tls.Config{
+				InsecureSkipVerify: dopts.InsecureSkipVerify,
 			}
-
-			config.NextProtos = []string{"http/1.1"}
-
-			conn, err = newConn(func(addr string) (net.Conn, error) {
-				return tls.DialWithDialer(dialer, "tcp", addr, config)
-			})(addr)
-		} else {
-			conn, err = newConn(func(addr string) (net.Conn, error) {
-				return dialer.DialContext(ctx, "tcp", addr)
-			})(addr)
 		}
-	}()
 
-	select {
-	case <-ctx.Done():
-		if conn != nil {
-			conn.Close()
-		}
-		return nil, ctx.Err()
-	case <-done:
+		config.NextProtos = []string{"http/1.1"}
+
+		conn, err = newConn(func(addr string) (net.Conn, error) {
+			return tls.DialWithDialer(dialer, "tcp", addr, config)
+		})(addr)
+	} else {
+		conn, err = newConn(func(addr string) (net.Conn, error) {
+			return net.DialTimeout("tcp", addr, dopts.Timeout)
+		})(addr)
 	}
 
 	if err != nil {
 		return nil, err
 	}
-
-	go func() {
-		<-ctx.Done()
-		if conn != nil {
-			conn.Close()
-		}
-	}()
 
 	return &httpTransportClient{
 		ht:       h,

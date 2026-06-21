@@ -6,10 +6,13 @@ import (
 	rtime "runtime"
 	"sync"
 
+	"github.com/pkg/errors"
+
 	"go-micro.dev/v5/client"
 	"go-micro.dev/v5/cmd"
 	log "go-micro.dev/v5/logger"
 	"go-micro.dev/v5/model"
+	"go-micro.dev/v5/registry"
 	"go-micro.dev/v5/server"
 	"go-micro.dev/v5/store"
 	signalutil "go-micro.dev/v5/internal/util/signal"
@@ -118,14 +121,43 @@ func (s *serviceImpl) String() string {
 }
 
 func (s *serviceImpl) Start() error {
+	var registeredServices []*registry.Service
+
 	for _, fn := range s.opts.BeforeStart {
+		before, _ := s.opts.Registry.ListServices()
+
 		if err := fn(); err != nil {
+			for _, svc := range registeredServices {
+				if derr := s.opts.Registry.Deregister(svc); derr != nil {
+					s.opts.Logger.Logf(log.ErrorLevel, "failed to deregister service on rollback: %v", derr)
+				}
+			}
 			return err
+		}
+
+		after, _ := s.opts.Registry.ListServices()
+
+		beforeSet := make(map[string]struct{}, len(before))
+		for _, svc := range before {
+			beforeSet[svc.Name] = struct{}{}
+		}
+
+		for _, svc := range after {
+			if _, exists := beforeSet[svc.Name]; !exists {
+				if detailed, err := s.opts.Registry.GetService(svc.Name); err == nil {
+					registeredServices = append(registeredServices, detailed...)
+				}
+			}
 		}
 	}
 
 	if err := s.opts.Server.Start(); err != nil {
-		return err
+		for _, svc := range registeredServices {
+			if derr := s.opts.Registry.Deregister(svc); derr != nil {
+				s.opts.Logger.Logf(log.ErrorLevel, "failed to deregister service on rollback: %v", derr)
+			}
+		}
+		return errors.Wrap(err, "server start failed")
 	}
 
 	for _, fn := range s.opts.AfterStart {
