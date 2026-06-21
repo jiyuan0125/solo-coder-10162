@@ -74,6 +74,15 @@ func (m *memRegistry) ttlPrune() {
 					}
 				}
 			}
+
+			for id, w := range m.watchers {
+				select {
+				case <-w.exit:
+					logger.Logf(log.DebugLevel, "Registry cleaning up dead watcher %s", id)
+					delete(m.watchers, id)
+				default:
+				}
+			}
 			m.Unlock()
 		}
 	}
@@ -96,7 +105,13 @@ func (m *memRegistry) sendEvent(r *Result) {
 		default:
 			select {
 			case w.res <- r:
-			case <-time.After(sendEventTime):
+			case <-w.exit:
+				m.Lock()
+				delete(m.watchers, w.id)
+				m.Unlock()
+			default:
+				logger := m.options.Logger
+				logger.Logf(log.DebugLevel, "Registry watcher %s buffer full, dropping event", w.id)
 			}
 		}
 	}
@@ -260,7 +275,7 @@ func (m *memRegistry) Watch(opts ...WatchOption) (Watcher, error) {
 
 	w := &memWatcher{
 		exit: make(chan bool),
-		res:  make(chan *Result),
+		res:  make(chan *Result, 128),
 		id:   uuid.New().String(),
 		wo:   wo,
 	}

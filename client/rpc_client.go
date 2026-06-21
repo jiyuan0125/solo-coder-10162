@@ -104,17 +104,11 @@ func (r *rpcClient) call(
 		}
 	}
 
-	// Set connection timeout for single requests to the server. Should be > 0
-	// as otherwise requests can't be made.
 	cTimeout := opts.ConnectionTimeout
-	if cTimeout == 0 {
-		logger.Log(log.DebugLevel, "connection timeout was set to 0, overridng to default connection timeout")
 
-		cTimeout = DefaultConnectionTimeout
+	if cTimeout > 0 {
+		msg.Header["Timeout"] = fmt.Sprintf("%d", cTimeout)
 	}
-
-	// set timeout in nanoseconds
-	msg.Header["Timeout"] = fmt.Sprintf("%d", cTimeout)
 	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
 	// set the accept header
@@ -131,6 +125,12 @@ func (r *rpcClient) call(
 		if err != nil {
 			return merrors.InternalServerError("go.micro.client", err.Error())
 		}
+	}
+
+	select {
+	case <-ctx.Done():
+		return merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+	default:
 	}
 
 	dOpts := []transport.DialOption{
@@ -179,14 +179,12 @@ func (r *rpcClient) call(
 		sendEOS:  false,
 	}
 
-	// close the stream on exiting this function
 	defer func() {
 		if err := stream.Close(); err != nil {
 			logger.Log(log.ErrorLevel, "failed to close stream", err)
 		}
 	}()
 
-	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
@@ -196,19 +194,30 @@ func (r *rpcClient) call(
 			}
 		}()
 
-		// send request
+		select {
+		case <-ctx.Done():
+			ch <- merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+			return
+		default:
+		}
+
 		if err := stream.Send(req.Body()); err != nil {
 			ch <- err
 			return
 		}
 
-		// recv response
+		select {
+		case <-ctx.Done():
+			ch <- merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+			return
+		default:
+		}
+
 		if err := stream.Recv(resp); err != nil {
 			ch <- err
 			return
 		}
 
-		// success
 		ch <- nil
 	}()
 
@@ -217,11 +226,21 @@ func (r *rpcClient) call(
 	select {
 	case err := <-ch:
 		return err
-	case <-time.After(cTimeout):
+	case <-ctx.Done():
 		grr = merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+	case <-time.After(cTimeout):
+		if cTimeout > 0 {
+			grr = merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout after %v", cTimeout))
+		} else {
+			select {
+			case err := <-ch:
+				return err
+			case <-ctx.Done():
+				grr = merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+			}
+		}
 	}
 
-	// set the stream error
 	if grr != nil {
 		stream.Lock()
 		stream.err = grr
@@ -237,6 +256,12 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 	address := node.Address
 	logger := r.Options().Logger
 
+	select {
+	case <-ctx.Done():
+		return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+	default:
+	}
+
 	msg := &transport.Message{
 		Header: make(map[string]string),
 	}
@@ -248,19 +273,14 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		}
 	}
 
-	// set timeout in nanoseconds
 	if opts.StreamTimeout > time.Duration(0) {
 		msg.Header["Timeout"] = fmt.Sprintf("%d", opts.StreamTimeout)
 	}
-	// set the content type for the request
 	msg.Header["Content-Type"] = req.ContentType()
-	// set the accept header
 	msg.Header["Accept"] = req.ContentType()
 
-	// set old codecs
 	nCodec := setupProtocol(msg, node)
 
-	// no codec specified
 	if nCodec == nil {
 		var err error
 
@@ -278,16 +298,20 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		dOpts = append(dOpts, transport.WithTimeout(opts.DialTimeout))
 	}
 
+	select {
+	case <-ctx.Done():
+		return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+	default:
+	}
+
 	c, err := r.opts.Transport.Dial(address, dOpts...)
 	if err != nil {
 		return nil, merrors.InternalServerError("go.micro.client", "connection error: %v", err)
 	}
 
-	// increment the sequence number
 	seq := atomic.AddUint64(&r.seq, 1) - 1
 	id := fmt.Sprintf("%v", seq)
 
-	// create codec with stream id
 	codec := newRPCCodec(msg, c, nCodec, id)
 
 	rsp := &rpcResponse{
@@ -295,7 +319,6 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		codec:  codec,
 	}
 
-	// set request codec
 	if r, ok := req.(*rpcRequest); ok {
 		r.codec = codec
 	}
@@ -306,18 +329,27 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		request:  req,
 		response: rsp,
 		codec:    codec,
-		// used to close the stream
-		closed: make(chan bool),
-		// signal the end of stream,
-		sendEOS: true,
-		release: func(_ error) {},
+		closed:   make(chan bool),
+		sendEOS:  true,
+		release:  func(_ error) {},
 	}
 
-	// wait for error response
 	ch := make(chan error, 1)
 
 	go func() {
-		// send the first message
+		defer func() {
+			if r := recover(); r != nil {
+				ch <- merrors.InternalServerError("go.micro.client", "panic recovered: %v", r)
+			}
+		}()
+
+		select {
+		case <-ctx.Done():
+			ch <- merrors.Timeout("go.micro.client", fmt.Sprintf("%v", ctx.Err()))
+			return
+		default:
+		}
+
 		ch <- stream.Send(req.Body())
 	}()
 
@@ -331,12 +363,10 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 	}
 
 	if grr != nil {
-		// set the error
 		stream.Lock()
 		stream.err = grr
 		stream.Unlock()
 
-		// close the stream
 		if err := stream.Close(); err != nil {
 			logger.Logf(log.ErrorLevel, "failed to close stream: %v", err)
 		}
@@ -520,6 +550,12 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 	var gerr error
 
 	for i := 0; i <= retries; i++ {
+		select {
+		case <-ctx.Done():
+			return merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
+		default:
+		}
+
 		go func(i int) {
 			ch <- call(i)
 		}(i)
@@ -528,7 +564,6 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 		case <-ctx.Done():
 			return merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
 		case err := <-ch:
-			// if the call succeeded lets bail early
 			if err == nil {
 				return nil
 			}
@@ -540,6 +575,12 @@ func (r *rpcClient) Call(ctx context.Context, request Request, response interfac
 
 			if !retry {
 				return err
+			}
+
+			select {
+			case <-ctx.Done():
+				return merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
+			default:
 			}
 
 			r.opts.Logger.Logf(log.DebugLevel, "Retrying request. Previous attempt failed with: %v", err)
@@ -622,6 +663,12 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 	var grr error
 
 	for i := 0; i <= retries; i++ {
+		select {
+		case <-ctx.Done():
+			return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
+		default:
+		}
+
 		go func(i int) {
 			s, err := call(i)
 			ch <- response{s, err}
@@ -631,7 +678,6 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 		case <-ctx.Done():
 			return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
 		case rsp := <-ch:
-			// if the call succeeded lets bail early
 			if rsp.err == nil {
 				return rsp.stream, nil
 			}
@@ -643,6 +689,12 @@ func (r *rpcClient) Stream(ctx context.Context, request Request, opts ...CallOpt
 
 			if !retry {
 				return nil, rsp.err
+			}
+
+			select {
+			case <-ctx.Done():
+				return nil, merrors.Timeout("go.micro.client", fmt.Sprintf("call timeout: %v", ctx.Err()))
+			default:
 			}
 
 			grr = rsp.err

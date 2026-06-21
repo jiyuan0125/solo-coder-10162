@@ -535,7 +535,6 @@ func (s *rpcServer) Start() error {
 	config := s.Options()
 	logger := config.Logger
 
-	// start listening on the listener
 	listener, err := config.Transport.Listen(config.Address, config.ListenOptions...)
 	if err != nil {
 		return err
@@ -543,32 +542,30 @@ func (s *rpcServer) Start() error {
 
 	logger.Logf(log.InfoLevel, "Transport [%s] Listening on %s", config.Transport.String(), listener.Addr())
 
-	// swap address
 	addr := s.swapAddr(config, listener.Addr())
 
-	// connect to the broker
 	brokerName := config.Broker.String()
 	if err = config.Broker.Connect(); err != nil {
 		logger.Logf(log.ErrorLevel, "Broker [%s] connect error: %v", brokerName, err)
+		listener.Close()
 		return err
 	}
 
 	logger.Logf(log.InfoLevel, "Broker [%s] Connected to %s", brokerName, config.Broker.Address())
 
-	// Use RegisterCheck func before register
 	if err = s.opts.RegisterCheck(s.opts.Context); err != nil {
 		logger.Logf(log.ErrorLevel, "Server %s-%s register check error: %s", config.Name, config.Id, err)
 	} else if err = s.Register(); err != nil {
-		// Perform initial registration
 		logger.Logf(log.ErrorLevel, "Server %s-%s register error: %s", config.Name, config.Id, err)
+		listener.Close()
+		config.Broker.Disconnect()
+		return err
 	}
 
 	exit := make(chan bool)
 
-	// Listen for connections
 	go s.listen(listener, exit)
 
-	// Keep the service registered to registry
 	go s.registrar(listener, addr, config, exit)
 
 	s.setStarted(true)
@@ -602,8 +599,6 @@ func (s *rpcServer) newRegFuc(config Options) func(service *registry.Service) er
 
 		var regErr error
 
-		// Attempt to register. If registration fails, back off and try again.
-		// TODO: see if we can improve the retry mechanism. Maybe retry lib, maybe config values
 		for i := 0; i < 3; i++ {
 			if regErr = config.Registry.Register(service, rOpts...); regErr != nil {
 				time.Sleep(backoff.Do(i + 1))
@@ -616,14 +611,20 @@ func (s *rpcServer) newRegFuc(config Options) func(service *registry.Service) er
 			return regErr
 		}
 
+		registered := true
+
 		s.Lock()
 		defer s.Unlock()
-		// Router can exchange messages on broker
-		// Subscribe to the topic with its own name
+
 		if err := s.subscribeServer(config); err != nil {
+			if registered {
+				if derr := config.Registry.Deregister(service); derr != nil {
+					config.Logger.Logf(log.ErrorLevel, "Server %s-%s deregister error on cleanup: %v", config.Name, config.Id, derr)
+				}
+			}
 			return errors.Wrap(err, "failed to subscribe to service name topic")
 		}
-		// Subscribe for all of the subscribers
+
 		s.reSubscribe(config)
 
 		return nil
