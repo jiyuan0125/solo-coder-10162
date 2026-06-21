@@ -584,11 +584,32 @@ func (s *rpcServer) Start() error {
 
 	if err = s.opts.RegisterCheck(s.opts.Context); err != nil {
 		logger.Logf(log.ErrorLevel, "Server %s-%s register check error: %s", config.Name, config.Id, err)
-	} else if err = s.Register(); err != nil {
-		logger.Logf(log.ErrorLevel, "Server %s-%s register error: %s", config.Name, config.Id, err)
-	} else {
-		registered = true
+		if derr := config.Broker.Disconnect(); derr != nil {
+			logger.Logf(log.ErrorLevel, "failed to disconnect broker after register check error: %v", derr)
+		}
+		if cerr := listener.Close(); cerr != nil {
+			logger.Logf(log.ErrorLevel, "failed to close listener after register check error: %v", cerr)
+		}
+		return errors.Wrap(err, "register check failed")
 	}
+
+	if err = s.Register(); err != nil {
+		logger.Logf(log.ErrorLevel, "Server %s-%s register error: %s", config.Name, config.Id, err)
+		if s.isRegistered() {
+			if derr := s.Deregister(); derr != nil {
+				logger.Logf(log.ErrorLevel, "failed to deregister after register error: %v", derr)
+			}
+		}
+		if derr := config.Broker.Disconnect(); derr != nil {
+			logger.Logf(log.ErrorLevel, "failed to disconnect broker after register error: %v", derr)
+		}
+		if cerr := listener.Close(); cerr != nil {
+			logger.Logf(log.ErrorLevel, "failed to close listener after register error: %v", cerr)
+		}
+		return errors.Wrap(err, "register failed")
+	}
+
+	registered = true
 
 	exit := make(chan bool)
 

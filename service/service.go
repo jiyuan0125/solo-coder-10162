@@ -6,10 +6,13 @@ import (
 	rtime "runtime"
 	"sync"
 
+	"github.com/pkg/errors"
+
 	"go-micro.dev/v5/client"
 	"go-micro.dev/v5/cmd"
 	log "go-micro.dev/v5/logger"
 	"go-micro.dev/v5/model"
+	"go-micro.dev/v5/registry"
 	"go-micro.dev/v5/server"
 	"go-micro.dev/v5/store"
 	signalutil "go-micro.dev/v5/internal/util/signal"
@@ -117,6 +120,26 @@ func (s *serviceImpl) String() string {
 	return "micro"
 }
 
+func (s *serviceImpl) deregisterService() {
+	sOpts := s.opts.Server.Options()
+	addr := sOpts.Address
+	if len(addr) == 0 {
+		addr = sOpts.Advertise
+	}
+	node := &registry.Node{
+		Id:      sOpts.Name + "-" + sOpts.Id,
+		Address: addr,
+	}
+	service := &registry.Service{
+		Name:    sOpts.Name,
+		Version: sOpts.Version,
+		Nodes:   []*registry.Node{node},
+	}
+	if rerr := sOpts.Registry.Deregister(service); rerr != nil {
+		s.opts.Logger.Logf(log.ErrorLevel, "failed to deregister service: %v", rerr)
+	}
+}
+
 func (s *serviceImpl) Start() error {
 	for _, fn := range s.opts.BeforeStart {
 		if err := fn(); err != nil {
@@ -125,12 +148,32 @@ func (s *serviceImpl) Start() error {
 	}
 
 	if err := s.opts.Server.Start(); err != nil {
-		return err
+		logger := s.opts.Logger
+		s.deregisterService()
+
+		for _, fn := range s.opts.AfterStart {
+			if ferr := fn(); ferr != nil {
+				logger.Logf(log.ErrorLevel, "AfterStart failed during rollback: %v", ferr)
+			}
+		}
+
+		for _, fn := range s.opts.BeforeStop {
+			if ferr := fn(); ferr != nil {
+				logger.Logf(log.ErrorLevel, "BeforeStop failed during rollback: %v", ferr)
+			}
+		}
+
+		return errors.Wrap(err, "server start failed")
 	}
 
 	for _, fn := range s.opts.AfterStart {
 		if err := fn(); err != nil {
-			return err
+			logger := s.opts.Logger
+			s.deregisterService()
+			if serr := s.opts.Server.Stop(); serr != nil {
+				logger.Logf(log.ErrorLevel, "failed to stop server after AfterStart error: %v", serr)
+			}
+			return errors.Wrap(err, "after start hook failed")
 		}
 	}
 

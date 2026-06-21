@@ -169,11 +169,13 @@ func (r *rpcClient) call(
 		request:  req,
 		response: rsp,
 		codec:    codec,
+		socket:   c,
 		closed:   make(chan bool),
 		close:    opts.ConnClose,
 		release:  releaseFunc,
 		sendEOS:  false,
 	}
+	stream.startCtxWatcher()
 
 	defer func() {
 		if err := stream.Close(); err != nil {
@@ -315,10 +317,12 @@ func (r *rpcClient) stream(ctx context.Context, node *registry.Node, req Request
 		request:  req,
 		response: rsp,
 		codec:    codec,
+		socket:   c,
 		closed:   make(chan bool),
 		sendEOS:  true,
 		release:  func(_ error) {},
 	}
+	stream.startCtxWatcher()
 
 	ch := make(chan error, 1)
 

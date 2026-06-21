@@ -2,10 +2,15 @@ package client
 
 import (
 	"context"
+	stderrors "errors"
 	"fmt"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
-	"go-micro.dev/v5/errors"
+	merrors "go-micro.dev/v5/errors"
 	"go-micro.dev/v5/registry"
 	"go-micro.dev/v5/selector"
 )
@@ -79,7 +84,7 @@ func TestCallRetry(t *testing.T) {
 		return func(_ context.Context, _ *registry.Node, _ Request, _ interface{}, _ CallOptions) error {
 			called++
 			if called == 1 {
-				return errors.InternalServerError("test.error", "retry request")
+				return merrors.InternalServerError("test.error", "retry request")
 			}
 			// don't do the call
 			return nil
@@ -173,5 +178,150 @@ func TestCallWrapper(t *testing.T) {
 
 	if !called {
 		t.Fatal("wrapper not called")
+	}
+}
+
+func TestCallCtxCancelNoExtraCalls(t *testing.T) {
+	service := "test.service.cancel"
+	endpoint := "Test.Endpoint"
+
+	address := "10.1.10.1:8080"
+	r := newTestRegistry()
+	err := r.Register(&registry.Service{
+		Name:    service,
+		Version: "latest",
+		Nodes: []*registry.Node{
+			{Id: service + "-1", Address: address},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var callCount int32
+	release := make(chan struct{})
+	var mu sync.Mutex
+
+	wrap := func(cf CallFunc) CallFunc {
+		return func(ctx context.Context, _ *registry.Node, _ Request, _ interface{}, _ CallOptions) error {
+			atomic.AddInt32(&callCount, 1)
+			mu.Lock()
+			releaseCh := release
+			mu.Unlock()
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-releaseCh:
+				return nil
+			case <-time.After(10 * time.Second):
+				return stderrors.New("timeout waiting in wrapper")
+			}
+		}
+	}
+
+	c := NewClient(
+		Registry(r),
+		WrapCall(wrap),
+		Retries(3),
+		Retry(RetryAlways),
+		RequestTimeout(200*time.Millisecond),
+	)
+	if err := c.Options().Selector.Init(selector.Registry(r)); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeGoroutines := runtime.NumGoroutine()
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	req := c.NewRequest(service, endpoint, nil)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Call(ctx, req, nil)
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+
+	cancel()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected Call to return error after cancel, got nil")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Call did not return within reasonable time after cancel")
+	}
+
+	mu.Lock()
+	close(release)
+	mu.Unlock()
+
+	time.Sleep(200 * time.Millisecond)
+
+	afterGoroutines := runtime.NumGoroutine()
+	leaked := afterGoroutines - beforeGoroutines
+	if leaked > 2 {
+		t.Errorf("too many leaked goroutines: before=%d after=%d leaked=%d",
+			beforeGoroutines, afterGoroutines, leaked)
+	}
+}
+
+func TestCallConnectionTimeoutZeroNotOverridden(t *testing.T) {
+	service := "test.service.timeout"
+	endpoint := "Test.Endpoint"
+	address := "10.1.10.1:8081"
+	r := newTestRegistry()
+	err := r.Register(&registry.Service{
+		Name:    service,
+		Version: "latest",
+		Nodes: []*registry.Node{
+			{Id: service + "-1", Address: address},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var timeoutHeader string
+	var mu sync.Mutex
+
+	wrap := func(cf CallFunc) CallFunc {
+		return func(ctx context.Context, node *registry.Node, req Request, resp interface{}, opts CallOptions) error {
+			mu.Lock()
+			if node != nil && req != nil {
+				timeoutHeader = fmt.Sprintf("%v", opts.ConnectionTimeout)
+			}
+			mu.Unlock()
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+			}
+			return nil
+		}
+	}
+
+	c := NewClient(
+		Registry(r),
+		WrapCall(wrap),
+	)
+	if err := c.Options().Selector.Init(selector.Registry(r)); err != nil {
+		t.Fatal(err)
+	}
+
+	req := c.NewRequest(service, endpoint, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+
+	_ = c.Call(ctx, req, nil, WithConnectionTimeout(0), WithAddress(address))
+
+	mu.Lock()
+	got := timeoutHeader
+	mu.Unlock()
+	if got != "0s" {
+		t.Errorf("WithConnectionTimeout(0) should remain as 0 duration (no Timeout header in real call), got opts.ConnectionTimeout=%s", got)
 	}
 }

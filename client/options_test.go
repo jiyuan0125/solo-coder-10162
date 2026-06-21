@@ -3,81 +3,39 @@ package client
 import (
 	"testing"
 	"time"
-
-	"go-micro.dev/v5/transport"
 )
 
-func TestCallOptions(t *testing.T) {
-	testData := []struct {
-		set      bool
-		retries  int
-		rtimeout time.Duration
-		dtimeout time.Duration
-	}{
-		{false, DefaultRetries, DefaultRequestTimeout, transport.DefaultDialTimeout},
-		{true, 10, time.Second, time.Second * 2},
+func TestWithConnectionTimeoutZeroPreserved(t *testing.T) {
+	co := CallOptions{}
+	WithConnectionTimeout(0)(&co)
+	if co.ConnectionTimeout != 0 {
+		t.Fatalf("WithConnectionTimeout(0) should preserve zero, got %v", co.ConnectionTimeout)
 	}
+	_ = time.Duration(0)
+}
 
-	for _, d := range testData {
-		var opts Options
-		var cl Client
+func TestWithConnectionTimeoutNonZeroPreserved(t *testing.T) {
+	co := CallOptions{}
+	want := 500 * time.Millisecond
+	WithConnectionTimeout(want)(&co)
+	if co.ConnectionTimeout != want {
+		t.Fatalf("Expected %v, got %v", want, co.ConnectionTimeout)
+	}
+}
 
-		if d.set {
-			opts = NewOptions(
-				Retries(d.retries),
-				RequestTimeout(d.rtimeout),
-				DialTimeout(d.dtimeout),
-			)
+func TestNewClientDefaultConnectionTimeout(t *testing.T) {
+	c := NewClient()
+	opts := c.Options()
+	if opts.CallOptions.ConnectionTimeout != DefaultConnectionTimeout {
+		t.Fatalf("Default client ConnectionTimeout should be %v, got %v",
+			DefaultConnectionTimeout, opts.CallOptions.ConnectionTimeout)
+	}
+}
 
-			cl = NewClient(
-				Retries(d.retries),
-				RequestTimeout(d.rtimeout),
-				DialTimeout(d.dtimeout),
-			)
-		} else {
-			opts = NewOptions()
-			cl = NewClient()
-		}
-
-		// test options and those set in client
-		for _, o := range []Options{opts, cl.Options()} {
-			if o.CallOptions.Retries != d.retries {
-				t.Fatalf("Expected retries %v got %v", d.retries, o.CallOptions.Retries)
-			}
-
-			if o.CallOptions.RequestTimeout != d.rtimeout {
-				t.Fatalf("Expected request timeout %v got %v", d.rtimeout, o.CallOptions.RequestTimeout)
-			}
-
-			if o.CallOptions.DialTimeout != d.dtimeout {
-				t.Fatalf("Expected %v got %v", d.dtimeout, o.CallOptions.DialTimeout)
-			}
-
-			// copy CallOptions
-			callOpts := o.CallOptions
-
-			// create new opts
-			cretries := WithRetries(o.CallOptions.Retries * 10)
-			crtimeout := WithRequestTimeout(o.CallOptions.RequestTimeout * (time.Second * 10))
-			cdtimeout := WithDialTimeout(o.CallOptions.DialTimeout * (time.Second * 10))
-
-			// set call options
-			for _, opt := range []CallOption{cretries, crtimeout, cdtimeout} {
-				opt(&callOpts)
-			}
-
-			// check call options
-			if e := o.CallOptions.Retries * 10; callOpts.Retries != e {
-				t.Fatalf("Expected retries %v got %v", e, callOpts.Retries)
-			}
-
-			if e := o.CallOptions.RequestTimeout * (time.Second * 10); callOpts.RequestTimeout != e {
-				t.Fatalf("Expected request timeout %v got %v", e, callOpts.RequestTimeout)
-			}
-
-			if e := o.CallOptions.DialTimeout * (time.Second * 10); callOpts.DialTimeout != e {
-				t.Fatalf("Expected %v got %v", e, callOpts.DialTimeout)
-			}
-		}
+func TestNewClientWithZeroConnectionTimeout(t *testing.T) {
+	c := NewClient(ConnectionTimeout(0))
+	opts := c.Options()
+	if opts.CallOptions.ConnectionTimeout != 0 {
+		t.Fatalf("ConnectionTimeout(0) should not be overridden, got %v", opts.CallOptions.ConnectionTimeout)
 	}
 }

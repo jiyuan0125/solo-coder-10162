@@ -242,3 +242,142 @@ func TestMemoryRegistryTTLConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestMemoryRegistrySlowWatcherDoesNotBlock(t *testing.T) {
+	m := NewMemoryRegistry().(*memRegistry)
+
+	svcName := "test.svc.slow.watcher"
+	svc := &Service{
+		Name:    svcName,
+		Version: "1.0.0",
+		Nodes: []*Node{
+			{Id: svcName + "-1", Address: "127.0.0.1:9001"},
+		},
+	}
+
+	slowW, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fastW, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = slowW
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 5; i++ {
+			_, err := fastW.Next()
+			if err != nil {
+				t.Errorf("fast watcher Next error: %v", err)
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 5; i++ {
+		if err := m.Register(svc); err != nil {
+			t.Fatal(err)
+		}
+		if err := m.Deregister(svc); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Duration(5*(sendEventTime+time.Millisecond*50)) + time.Second*2):
+		t.Fatal("fast watcher was blocked by slow watcher")
+	}
+
+	slowW.Stop()
+	fastW.Stop()
+}
+
+func TestMemoryRegistryWatcherStopRemovesFromMap(t *testing.T) {
+	m := NewMemoryRegistry().(*memRegistry)
+
+	w1, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m.RLock()
+	count := len(m.watchers)
+	m.RUnlock()
+	if count != 2 {
+		t.Fatalf("expected 2 watchers, got %d", count)
+	}
+
+	w1.Stop()
+
+	time.Sleep(time.Millisecond * 50)
+
+	m.RLock()
+	count = len(m.watchers)
+	m.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 watcher after Stop, got %d", count)
+	}
+
+	w2.Stop()
+	time.Sleep(time.Millisecond * 50)
+
+	m.RLock()
+	count = len(m.watchers)
+	m.RUnlock()
+	if count != 0 {
+		t.Fatalf("expected 0 watchers after both Stop, got %d", count)
+	}
+}
+
+func TestMemoryRegistryDeadWatcherCleanedOnSendEvent(t *testing.T) {
+	m := NewMemoryRegistry().(*memRegistry)
+
+	_, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+	w2, err := m.Watch()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m.RLock()
+	count := len(m.watchers)
+	m.RUnlock()
+	if count != 2 {
+		t.Fatalf("expected 2 watchers initially, got %d", count)
+	}
+
+	w2.Stop()
+	time.Sleep(time.Millisecond * 50)
+
+	svc := &Service{
+		Name:    "dead.watcher.test",
+		Version: "1.0.0",
+		Nodes: []*Node{
+			{Id: "n1", Address: "127.0.0.1:9002"},
+		},
+	}
+	if err := m.Register(svc); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(time.Millisecond * 100)
+
+	m.RLock()
+	count = len(m.watchers)
+	m.RUnlock()
+	if count != 1 {
+		t.Fatalf("expected 1 watcher after sendEvent cleaned dead one, got %d", count)
+	}
+}

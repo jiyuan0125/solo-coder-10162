@@ -9,24 +9,23 @@ import (
 	"go-micro.dev/v5/codec"
 )
 
-// Implements the streamer interface.
 type rpcStream struct {
 	err      error
 	request  Request
 	response Response
 	codec    codec.Codec
+	socket   interface{ Close() error }
 	context  context.Context
 
-	closed chan bool
+	closed    chan bool
+	closeOnce sync.Once
+	cancelOnce sync.Once
 
-	// release releases the connection back to the pool
 	release func(err error)
 	id      string
 	sync.RWMutex
-	// Indicates whether connection should be closed directly.
 	close bool
 
-	// signal whether we should send EOS
 	sendEOS bool
 }
 
@@ -37,6 +36,23 @@ func (r *rpcStream) isClosed() bool {
 	default:
 		return false
 	}
+}
+
+func (r *rpcStream) startCtxWatcher() {
+	go func() {
+		select {
+		case <-r.context.Done():
+			r.cancelOnce.Do(func() {
+				r.Lock()
+				r.err = r.context.Err()
+				r.Unlock()
+				if r.socket != nil {
+					_ = r.socket.Close()
+				}
+			})
+		case <-r.closed:
+		}
+	}()
 }
 
 func (r *rpcStream) Context() context.Context {
@@ -52,19 +68,22 @@ func (r *rpcStream) Response() Response {
 }
 
 func (r *rpcStream) Send(msg interface{}) error {
-	r.Lock()
-	defer r.Unlock()
-
+	r.RLock()
+	if r.isClosed() {
+		r.RUnlock()
+		r.Lock()
+		r.err = errShutdown
+		r.Unlock()
+		return errShutdown
+	}
 	select {
 	case <-r.context.Done():
+		r.RUnlock()
+		r.Lock()
 		r.err = r.context.Err()
+		r.Unlock()
 		return r.err
 	default:
-	}
-
-	if r.isClosed() {
-		r.err = errShutdown
-		return errShutdown
 	}
 
 	req := codec.Message{
@@ -74,9 +93,14 @@ func (r *rpcStream) Send(msg interface{}) error {
 		Endpoint: r.request.Endpoint(),
 		Type:     codec.Request,
 	}
+	r.RUnlock()
 
-	if err := r.codec.Write(&req, msg); err != nil {
+	err := r.codec.Write(&req, msg)
+
+	if err != nil {
+		r.Lock()
 		r.err = err
+		r.Unlock()
 		return err
 	}
 
@@ -84,69 +108,70 @@ func (r *rpcStream) Send(msg interface{}) error {
 }
 
 func (r *rpcStream) Recv(msg interface{}) error {
-	r.Lock()
-
+	r.RLock()
+	if r.isClosed() {
+		r.RUnlock()
+		r.Lock()
+		r.err = errShutdown
+		r.Unlock()
+		return errShutdown
+	}
 	select {
 	case <-r.context.Done():
+		r.RUnlock()
+		r.Lock()
 		r.err = r.context.Err()
 		r.Unlock()
 		return r.err
 	default:
 	}
-
-	if r.isClosed() {
-		r.err = errShutdown
-		r.Unlock()
-
-		return errShutdown
-	}
+	r.RUnlock()
 
 	var resp codec.Message
 
-	r.Unlock()
 	err := r.codec.ReadHeader(&resp, codec.Response)
-	r.Lock()
-
 	if err != nil {
+		r.Lock()
 		if errors.Is(err, io.EOF) && !r.isClosed() {
 			r.err = io.ErrUnexpectedEOF
 			r.Unlock()
-
 			return io.ErrUnexpectedEOF
 		}
-
 		r.err = err
-
 		r.Unlock()
-
 		return err
 	}
 
 	switch {
 	case len(resp.Error) > 0:
 		if resp.Error != lastStreamResponseError {
+			r.Lock()
 			r.err = serverError(resp.Error)
+			r.Unlock()
 		} else {
+			r.Lock()
 			r.err = io.EOF
+			r.Unlock()
 		}
-		r.Unlock()
 		err = r.codec.ReadBody(nil)
-		r.Lock()
 		if err != nil {
+			r.Lock()
 			r.err = err
+			r.Unlock()
 		}
 	default:
-		r.Unlock()
 		err = r.codec.ReadBody(msg)
-		r.Lock()
 		if err != nil {
+			r.Lock()
 			r.err = err
+			r.Unlock()
 		}
 	}
 
-	defer r.Unlock()
-
-	return r.err
+	r.RLock()
+	rerr := r.err
+	r.RUnlock()
+	return rerr
 }
 
 func (r *rpcStream) Error() error {
@@ -161,20 +186,13 @@ func (r *rpcStream) CloseSend() error {
 }
 
 func (r *rpcStream) Close() error {
-	r.Lock()
-
-	select {
-	case <-r.closed:
-		r.Unlock()
-		return nil
-	default:
+	var closeErr error
+	r.closeOnce.Do(func() {
+		r.Lock()
 		close(r.closed)
 		r.Unlock()
 
-		// send the end of stream message
 		if r.sendEOS {
-			// no need to check for error
-			//nolint:errcheck,gosec
 			r.codec.Write(&codec.Message{
 				Id:       r.id,
 				Target:   r.request.Service(),
@@ -185,15 +203,13 @@ func (r *rpcStream) Close() error {
 			}, nil)
 		}
 
-		err := r.codec.Close()
+		closeErr = r.codec.Close()
 
 		rerr := r.Error()
 		if r.close && rerr == nil {
 			rerr = errors.New("connection header set to close")
 		}
-		// release the connection
 		r.release(rerr)
-
-		return err
-	}
+	})
+	return closeErr
 }
